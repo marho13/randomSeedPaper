@@ -11,6 +11,8 @@ from collections import namedtuple
 from collections import Counter
 from collections import deque
 import ray
+import sys, time
+from DQNConv import DQN as CNNDQN
 
 #Transition, the format of the memory
 Transition = namedtuple('Transition',
@@ -87,6 +89,7 @@ class DQN():
         loss.backward()
         for param in self.policy_net.parameters():
             param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
 
 
 class ConvNet(nn.Module):
@@ -103,7 +106,7 @@ class ConvNet(nn.Module):
         self.out = nn.Linear(in_features=n_latent_var, out_features=outputSize).float()
 
     def forward(self, t):
-        t = torch.flatten(t, start_dim=1).float()
+        t = t.float()# t = torch.flatten(t, start_dim=1).float()
         t = self.fc1(t).float()
         t = F.relu(t).float()
         t = self.fc2(t).float()
@@ -129,10 +132,12 @@ class ConvNet(nn.Module):
             if g is not None:
                 p.grad = torch.from_numpy(g)
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)
+
+@ray.remote(max_restarts=-1, max_task_retries=-1, memory=1024*1024*1024)
 class DataWorker(object):
-    def __init__(self, state_dim, action_dim, n_latent_var, lr, betas, gamma, i, seedList, numWorkers):
+    def __init__(self, state_dim, action_dim, n_latent_var, lr, betas, gamma, i, seedList, numWorkers, gymseed):
         #Hyper parameters
+        self.gymseed = gymseed
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.n_latent_var = n_latent_var
@@ -148,14 +153,18 @@ class DataWorker(object):
         self.rewards = []
         self.seedList = seedList
         self.numWorkers = numWorkers
+        self.device = "cuda:{}".format((i//2)+1)
+        print(self.device)
 
     def rewEnv(self):
         seed = self.seedList[self.num] + self.id
         #Fix the random seeds
         torch.manual_seed(seed)
-        self.DQN = DQN(self.state_dim, self.action_dim, self.n_latent_var, self.lr, self.betas, self.gamma)
-        self.env.seed(seed)
+        self.env.seed(self.gymseed)
         np.random.seed(seed)
+
+        #Model creation
+        self.DQN = CNNDQN(self.action_dim, self.n_latent_var, self.lr, self.betas, self.gamma).to(self.device)
 
         #Perform actions in environment
         rewards = self.performNActions(1000)
@@ -179,13 +188,14 @@ class DataWorker(object):
             actionTranslated = self.translateAction(action)
             state, rew, done, info = self.env.step(actionTranslated)
             totalRew += rew
-            prevState = torch.unsqueeze(prevState, 0)
-            stateMem = torch.unsqueeze(torch.from_numpy(state.copy()), 0)
+            # prevState = torch.unsqueeze(prevState, 0)
+            # stateMem = torch.unsqueeze(torch.from_numpy(state.copy()), 0)
             rew = torch.unsqueeze(torch.tensor(rew), 0)
-            memory.push(prevState, action, stateMem, rew)
+            memory.push(prevState, action, state, rew)
             if done:
                 print(t, totalRew)
-                state = self.env.reset()
+                break
+
         self.lastRew = totalRew
         return totalRew
 
@@ -193,47 +203,65 @@ class DataWorker(object):
         return self.lastRew
 
     def numpyToTensor(self, state):
+        state = self.intTofloat(state)
         s = np.expand_dims(state, axis=0)
         s = np.swapaxes(s, 1, -1)
-        return torch.from_numpy(s.copy())
+        return torch.from_numpy(s.copy()).float().to(self.device)
+
+    def intTofloat(self, state):
+        return state / 255.0
 
     def translateAction(self, action):
         actionDict = {0: np.array([0, 1.0, 0]), 1: np.array([-1.0, 0, 0]), 2: np.array([0, 0, 1]),
                       3: np.array([1.0, 0, 0])}
         return actionDict[action.item()]
 
+
+
+errorFile = open("error.txt", mode="a")
+start = time.process_time()
 seedList = [i for i in range(10)]
 numActions = 4
 stateDim = 96 * 96 * 3
-n_latent_var = 64
+n_latent_var = 256
 lr = 0.002
 betas = (0.9, 0.999)
 gamma = 0.9
-num_workers = 2  # Set gpu to num_workers//num_gpu
+num_workers = 30  # Set gpu to num_workers//num_gpu
 env = gym.make("CarRacing-v0")
+gymSeeds = [0, 1, 2, 3, 4]
 
 ray.init(ignore_reinit_error=True)
-workers = [DataWorker.remote(stateDim, numActions, n_latent_var, lr, betas, gamma, i, "rewards{}.csv".format(i), seedList, num_workers)
-           for i in range(num_workers)]
+for s in gymSeeds:
+    workers = [DataWorker.remote(stateDim, numActions, n_latent_var, lr, betas, gamma, x, seedList, num_workers, s)
+               for x in range(num_workers)]
 
-model = DQN(stateDim, numActions, n_latent_var, lr, betas, gamma)
+    start = seedList[0]
+    stop = seedList[-1] + 1
+    print(start, stop)
+    print(num_workers)
 
-start = seedList[0]
-stop = seedList[-1] + 1
-print(start, stop)
-print(num_workers)
+    fileOpen = open("rewards{}.csv".format(s), "w")
+    print("Running synchronous parameter server training.")
+    for i in range(seedList[0], seedList[-1]+1, num_workers):
+        print(s, i)
+        try:
+            rewards = [worker.rewEnv.remote()
+                    for worker in workers]
+            x = (ray.get(rewards))
+            for r in x:
+                print(r)
+                fileOpen.write(str(r[0]).format('{:3f}') + "," + str(r[1]).format('{:2f}') + ",,")
 
-fileOpen = open("rewards.csv", "w")
-print("Running synchronous parameter server training.")
-for i in range(seedList[0], seedList[-1]+1, num_workers):
-    print(seedList[i])
-    rewards = [worker.rewEnv.remote()
-               for worker in workers]
-    x = (ray.get(rewards))
-    for r in x:
-        print(r)
-        fileOpen.write(str(r[0]).format('{:3f}') + "," + str(r[1]).format('{:2f}') + ",,")
+            fileOpen.write("\n")
+            del rewards
+        except Exception as e:
+            errorFile.write(e)
+            errorFile.write(i)
+            sys.exit(1)
 
-    fileOpen.write("\n")
+
+        time.sleep(0.5)
+        print(time.process_time()-start)
 
 ray.shutdown()
